@@ -1,0 +1,382 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use Sys::Syslog;
+use Digest::MD5 qw{md5_hex};
+use Net::LDAP;
+use Net::LDAP::Entry;
+use Locale::Currency::Format;
+
+$0 =~ m!^(.*)/([^/]+)\s*$!;
+my $progname = ($2 || $0);
+my $progpath = ($1 || "/usr/lib/cups/backend");
+
+my $beh = "$progname:/enablequotas;defenable/ldaphost;binddn;passfile;basedn/\$def.currency\(\$per.page\);guest;banner;email/dd;att;delay;delete/log[;debug]/<original uri>";
+do { print "network $progname \"Unknown\" \"Backend Error Handler\"\n"; exit 0; } unless $ARGV[0];
+do { print STDERR "ERROR: Usage: $progname job-id user title copies options [file]\n"; exit 1; } if scalar(@ARGV) < 5 || scalar(@ARGV) > 6;
+my ($jobID, $userName, $jobTitle, $copies, $printOptions, $printFile) = @ARGV;
+
+# Something to eliminate duplicates, to ignore when a user presses print several times in a row.
+# printFile being deleted despite $delete = 0
+# Watermark per person via LDAP per printer via conf
+
+# Parse /etc/cups/printers.conf DeviceURI
+$_ = $ENV{DEVICE_URI};
+my ($enable, $defenable, $ldaphost, $binddn, $passwordfile, $basedn, $defquota, $guest, $banner, $email, $dd, $attempts, $delay, $delete, $syslog, $debug, $uri) =
+	(m!^$progname:/(\d+);(\d+)/([^;]+);([^;]+);([^;]+);([^;]+)/(\$\d+\.\d+\(\$\d+\.\d+\));(\d+);(\d+);(\d+)/(\d+);(\d+);(\d+);(\d+)/(\d+);?(\d+)?/(\S+)$!)
+	or die "URI must be \"$beh\"!\n";
+$uri =~ m!^([^:\s]+):!;
+my $backend = $1;
+$ENV{DEVICE_URI} = $uri;
+
+# Initialize variables
+my $printerQuotaCost = 0;
+my $printerQuotaCurrencyRemaining = 0;
+my $printerQuotaCurrencyUsed = 0;
+my $printerQuotaPagesPrinted = 0;
+my $printerQuotaPrinter = 0;
+my $pages = 0;
+my $cost = 0;
+my $sizeof = 0;
+my $exitvalue = '';
+my $date = scalar localtime();
+
+$defenable = ($defenable ? '' : '!').$ENV{PRINTER};
+$defquota =~ /^\$(\d+)\.(\d+)\(\$(\d+)\.(\d+)\)$/;
+$defquota = $1 * 100 + $2;
+$printerQuotaCost = $3 * 100 + $4;
+$pages = int(qx{/usr/bin/pkpgcounter $printFile});
+$cost = $pages * $printerQuotaCost;
+$sizeof = -s $printFile;
+
+# Logging
+openlog($progname, '', 'syslog') if $syslog;
+syslog('info', "$jobID;$ENV{PRINTER};$userName | Attempting to print $pages pages of '$jobTitle'") if $syslog;
+syslog('info', "$jobID;$ENV{PRINTER};$userName | ENV: $_") if $syslog && $debug;
+syslog('info', "$jobID;$ENV{PRINTER};$userName | Default Quota: $defquota; Default Printer Enable: $defenable") if $syslog && $debug >= 2;
+
+# Quota support disabled in URI
+if ( ! $enable ) {
+	syslog('info', "$jobID;$ENV{PRINTER};$userName | Quota system disabled") if $syslog;
+	$exitvalue = printer($progpath, $backend, $uri, $jobID, $userName, $jobTitle, $copies, $printOptions, $printFile);
+	if ( $banner >= 2 ) {
+		printer($progpath, $backend, $uri, $jobID, $userName, 'BANNER: Disable', "$date\r\n\r\n$jobTitle for $userName\r\n\r\nQuota system has been administratively disabled.", $printOptions);
+		$dd = 1;
+	}
+	if ( $email ) {
+	}
+	syslog('info', "$jobID;$ENV{PRINTER};$userName | Exit value: $exitvalue") if $syslog && $debug >= 2;
+	$exitvalue = 0 if $dd;
+	exit $exitvalue;
+}
+
+my ($ldap, $bind, $useldap);
+if ( $ldap = Net::LDAP->new($ldaphost, version => 3, timeout => 3) ) {
+        $bind = $binddn && $passwordfile ? $ldap->bind($binddn, password=>bindpw($passwordfile)) : $ldap->bind();
+        undef $passwordfile;
+}
+if ( $bind->code ) {
+        syslog('info', "$jobID;$ENV{PRINTER};$userName | Invalid DN and/or password: $binddn") if $syslog;
+        undef $ldap;
+        undef $bind;
+}
+if ( $ldap && $bind && $basedn ) {
+        $useldap = 1;
+        syslog('info', "$jobID;$ENV{PRINTER};$userName | Using LDAP") if $syslog && $debug;
+} else {
+        $useldap = 0;
+        syslog('info', "$jobID;$ENV{PRINTER};$userName | NOT using LDAP") if $syslog && $debug;
+}
+
+# Create in LDAP the necessary attributes with defaults
+my $entry;
+if ( $useldap ) {   
+	my $search = $ldap->search(base=>$basedn, filter=>"uid=$userName");
+	if ( $search->code ) {
+		$useldap = 0;
+		syslog('info', "$jobID;$ENV{PRINTER};$userName | LDAP Error: %s", $search->error) if $syslog && $debug;
+	} elsif ( $search->count <= 0 ) {
+		$useldap = 0;
+		syslog('info', "$jobID;$ENV{PRINTER};$userName | Username not found in LDAP") if $syslog;
+		exit 0 unless $guest;
+		syslog('info', "$jobID;$ENV{PRINTER};$userName | Allowing guest printing") if $syslog;
+	} else {
+		$entry = $search->entry(0);
+		my @oc = $entry->get_value('objectClass');
+		if ( grep { /^local$/ } @oc ) {
+			syslog('info', "$jobID;$ENV{PRINTER};$userName | local objectClass already added") if $syslog && $debug;
+		} else {
+			my $modify = $ldap->modify($entry->dn, add => {objectClass => 'local'});
+			if ( $modify->code ) {
+				$useldap = 0;
+				syslog('info', "$jobID;$ENV{PRINTER};$userName | -ERR Failed to add objectClass local: %s", $modify->error) if $syslog;
+			} else {
+				syslog('info', "$jobID;$ENV{PRINTER};$userName | +OK Added objectClass local") if $syslog;
+			}
+		}
+		if ( $entry->exists("localPrinterQuotaCurrencyRemaining") ) {
+			$printerQuotaCurrencyRemaining = $entry->get_value("localPrinterQuotaCurrencyRemaining");
+			unless ( $printerQuotaCurrencyRemaining =~ /^-?\d+$/ ) {
+				syslog('info', "$jobID;$ENV{PRINTER};$userName | localPrinterQuotaCurrencyRemaining attr corrupt.  Attempting to fix...") if $syslog;
+				my $modify = $ldap->modify($entry->dn, replace => {localPrinterQuotaCurrencyRemaining => $defquota});
+				if ( $modify->code ) {
+					$useldap = 0;
+					syslog('info', "$jobID;$ENV{PRINTER};$userName | -ERR Failed to reset default %s to localPrinterQuotaCurrencyRemaining: %s", currency_format('usd', $defquota/100, FMT_SYMBOL), $modify->error) if $syslog;
+				} else {
+					$printerQuotaCurrencyRemaining = $defquota;
+					syslog('info', "$jobID;$ENV{PRINTER};$userName | +OK Reset localPrinterQuotaCurrencyRemaining to default %s", currency_format('usd', $defquota/100, FMT_SYMBOL)) if $syslog;
+				}
+			}
+		} else {
+			my $modify = $ldap->modify($entry->dn, add => {localPrinterQuotaCurrencyRemaining => $defquota});
+			if ( $modify->code ) {
+				$useldap = 0;
+				syslog('info', "$jobID;$ENV{PRINTER};$userName | -ERR Failed to initialize default %s to localPrinterQuotaCurrencyRemaining: %s", currency_format('usd', $defquota/100, FMT_SYMBOL), $modify->error) if $syslog;
+			} else {
+				$printerQuotaCurrencyRemaining = $defquota;
+				syslog('info', "$jobID;$ENV{PRINTER};$userName | +OK Initialized localPrinterQuotaCurrencyRemaining to default %s", currency_format('usd', $defquota/100, FMT_SYMBOL)) if $syslog;
+			}
+		}
+		if ( $entry->exists("localPrinterQuotaPagesPrinted") ) {
+			$printerQuotaPagesPrinted = $entry->get_value("localPrinterQuotaPagesPrinted");
+			unless ( $printerQuotaPagesPrinted =~ /^\d+$/ ) {
+				syslog('info', "$jobID;$ENV{PRINTER};$userName | localPrinterQuotaPagesPrinted attr corrupt.  Attempting to fix...") if $syslog;
+				my $modify = $ldap->modify($entry->dn, replace => {localPrinterQuotaPagesPrinted => 0});
+				if ( $modify->code ) {
+					$useldap = 0;
+					syslog('info', "$jobID;$ENV{PRINTER};$userName | -ERR Failed to reset localPrinterQuotaPagesPrinted: %s", $modify->error) if $syslog;
+				} else {
+					$printerQuotaPagesPrinted = 0;
+					syslog('info', "$jobID;$ENV{PRINTER};$userName | +OK Reset localPrinterQuotaPagesPrinted") if $syslog;
+				}
+			}
+		} else {
+			my $modify = $ldap->modify($entry->dn, add => {localPrinterQuotaPagesPrinted => 0});
+			if ( $modify->code ) {
+				$useldap = 0;
+				syslog('info', "$jobID;$ENV{PRINTER};$userName | -ERR Failed to initialize localPrinterQuotaPagesPrinted: %s", $modify->error) if $syslog;
+			} else {
+				$printerQuotaPagesPrinted = 0;
+				syslog('info', "$jobID;$ENV{PRINTER};$userName | +OK Initialized localPrinterQuotaPagesPrinted") if $syslog;
+			}
+		}
+		if ( $entry->exists("localPrinterQuotaCurrencyUsed") ) {
+			$printerQuotaCurrencyUsed = $entry->get_value("localPrinterQuotaCurrencyUsed");
+			unless ( $printerQuotaCurrencyUsed =~ /^\d+$/ ) {
+				syslog('info', "$jobID;$ENV{PRINTER};$userName | localPrinterQuotaCurrencyUsed attr corrupt.  Attempting to fix...") if $syslog;
+				my $modify = $ldap->modify($entry->dn, replace => {localPrinterQuotaCurrencyUsed => 0});
+				if ( $modify->code ) {
+					$useldap = 0;
+					syslog('info', "$jobID;$ENV{PRINTER};$userName | -ERR Failed to reset localPrinterQuotaCurrencyUsed: %s", $modify->error) if $syslog;
+				} else {
+					$printerQuotaCurrencyUsed = 0;
+					syslog('info', "$jobID;$ENV{PRINTER};$userName | +OK Reset localPrinterQuotaCurrencyUsed") if $syslog;
+				}
+			}
+		} else {
+			my $modify = $ldap->modify($entry->dn, add => {localPrinterQuotaCurrencyUsed => 0});
+			if ( $modify->code ) {
+				$useldap = 0;
+				syslog('info', "$jobID;$ENV{PRINTER};$userName | -ERR Failed to initialize localPrinterQuotaCurrencyUsed: %s", $modify->error) if $syslog;
+			} else {
+				$printerQuotaCurrencyUsed = 0;
+				syslog('info', "$jobID;$ENV{PRINTER};$userName | +OK Initialized localPrinterQuotaCurrencyUsed") if $syslog;
+			}
+		}
+		if ( $entry->exists("localPrinterQuotaPrinter") ) {
+			my @printerQuotaPrinter = $entry->get_value("localPrinterQuotaPrinter");
+			@_ = grep { /$ENV{PRINTER}$/ } @printerQuotaPrinter;
+			$printerQuotaPrinter = $_[0];
+			syslog('info', "$jobID;$ENV{PRINTER};$userName | printerQuotaPrinter = $printerQuotaPrinter") if $syslog && $debug >= 2;
+			unless ( $printerQuotaPrinter ) {
+				my $modify = $ldap->modify($entry->dn, add => {localPrinterQuotaPrinter => $defenable});
+				if ( $modify->code ) {
+					$useldap = 0;
+					syslog('info', "$jobID;$ENV{PRINTER};$userName | -ERR Failed to %s localPrinterQuotaPrinter: %s", ($defenable ? 'enable' : 'disable'), $modify->error) if $syslog;
+				} else {
+					$printerQuotaPrinter = $defenable;
+					syslog('info', "$jobID;$ENV{PRINTER};$userName | +OK %s localPrinterQuotaPrinter", ($defenable ? 'Enabled' : 'Disabled')) if $syslog;
+				}
+			}
+		} else {
+			my $modify = $ldap->modify($entry->dn, add => {localPrinterQuotaPrinter => $defenable});
+			if ( $modify->code ) {
+				$useldap = 0;
+				syslog('info', "$jobID;$ENV{PRINTER};$userName | -ERR Failed to %s localPrinterQuotaPrinter: %s", ($defenable ? 'enable' : 'disable'), $modify->error) if $syslog;
+			} else {
+				$printerQuotaPrinter = $defenable;
+				syslog('info', "$jobID;$ENV{PRINTER};$userName | +OK %s localPrinterQuotaPrinter", ($defenable ? 'Enabled' : 'Disabled')) if $syslog;
+			}
+		}
+	}
+} else {
+	$useldap = 0;
+	syslog('info', "$jobID;$ENV{PRINTER};$userName | Cannot connect to LDAP as requested.") if $syslog && $debug;
+}
+
+# Do the math
+if ( $useldap ) {
+	# Determine if user is allowed to print or not and whether or not it's unlimited printing
+	if ( $printerQuotaPrinter =~ /^\*/ ) {
+		$printerQuotaPrinter = -1
+	} elsif ( $printerQuotaPrinter =~ /^\!/ ) {
+		$printerQuotaPrinter = 0
+	} else {
+		$printerQuotaPrinter = 1
+	}
+	syslog('info', "$jobID;$ENV{PRINTER};$userName | printerQuotaPrinter = $printerQuotaPrinter") if $syslog && $debug >= 2;
+	# Printing disabled on this printer for this user
+	if ( $printerQuotaPrinter == 0 ) {
+		syslog('info', "$jobID;$ENV{PRINTER};$userName | Printer disabled for user") if $syslog;
+		if ( $banner >= 1 ) {
+			@_ = ( currency_format('usd', $cost/100, FMT_SYMBOL), currency_format('usd', $printerQuotaCurrencyRemaining/100, FMT_SYMBOL), currency_format('usd', $printerQuotaCurrencyUsed/100, FMT_SYMBOL) );
+			printer($progpath, $backend, $uri, $jobID, $userName, 'BANNER: Printer disabled for user', "Date: $date\r\nUsername: $userName\r\nJob Title: $jobTitle\r\nPages Attempted: $pages\r\nCost of Job: $_[0]\r\nAccount Balance: $_[1]\r\nLife-time Pages Printed: $printerQuotaPagesPrinted\r\nLife-time Money Used: $_[2]\r\n\r\nPrinting to $ENV{PRINTER} for $userName not allowed.", $printOptions);
+			$dd = 1;
+		}
+		if ( $email ) {
+		}
+	# Go ahead with printing
+	} elsif ( $printerQuotaPrinter == -1 || $printerQuotaCurrencyRemaining - $cost >= 0 ) {
+		$exitvalue = printer($progpath, $backend, $uri, $jobID, $userName, $jobTitle, $copies, $printOptions, $printFile, $sizeof, $pages, $printerQuotaCurrencyRemaining);
+		if ( $exitvalue ) {
+			syslog('info', "$jobID;$ENV{PRINTER};$userName | -ERR Failed to print $pages pages of '$jobTitle': $exitvalue") if $syslog;
+		} else {
+			syslog('info', "$jobID;$ENV{PRINTER};$userName | +OK Successfully printed $pages pages of '$jobTitle' at a cost of %s", currency_format('usd', $cost/100, FMT_SYMBOL)) if $syslog;
+			$printerQuotaCurrencyUsed += $cost;
+			$printerQuotaPagesPrinted += $pages;
+			# Unlimited printing
+			if ( $printerQuotaPrinter == -1 ) {
+				syslog('info', "$jobID;$ENV{PRINTER};$userName | Infinite account balance for this user on this printer") if $syslog;
+				my $modify = $ldap->modify($entry->dn,
+					replace => {
+						localPrinterQuotaPagesPrinted => $printerQuotaPagesPrinted,
+						localPrinterQuotaCurrencyUsed => $printerQuotaCurrencyUsed,
+					}
+				);
+				if ( $modify->code ) {
+					syslog('info', "$jobID;$ENV{PRINTER};$userName | -ERR Failed to add $pages pages to localPrinterQuotaPagesPrinted and set to $printerQuotaPagesPrinted: %s", currency_format('usd', $printerQuotaCurrencyRemaining/100, FMT_SYMBOL), $modify->error) if $syslog;
+					syslog('info', "$jobID;$ENV{PRINTER};$userName | -ERR Failed to add %s to localPrinterQuotaCurrencyUsed and set to %s: %s", currency_format('usd', $cost/100, FMT_SYMBOL), currency_format('usd', $printerQuotaCurrencyUsed/100, FMT_SYMBOL), $modify->error) if $syslog;
+					if ( $email ) {
+					}
+				} else {
+					syslog('info', "$jobID;$ENV{PRINTER};$userName | +OK Added $pages pages to localPrinterQuotaPagesPrinted and set to $printerQuotaPagesPrinted", currency_format('usd', $printerQuotaCurrencyRemaining/100, FMT_SYMBOL)) if $syslog;
+					syslog('info', "$jobID;$ENV{PRINTER};$userName | +OK Added %s to localPrinterQuotaCurrencyUsed and set to %s", currency_format('usd', $cost/100, FMT_SYMBOL), currency_format('usd', $printerQuotaCurrencyUsed/100, FMT_SYMBOL)) if $syslog;
+				}
+			# Subtract the cost from the account balance
+			} else {
+				$printerQuotaCurrencyRemaining -= $cost;
+				my $modify = $ldap->modify($entry->dn,
+					replace => {
+						localPrinterQuotaCurrencyRemaining => $printerQuotaCurrencyRemaining,
+						localPrinterQuotaPagesPrinted => $printerQuotaPagesPrinted,
+						localPrinterQuotaCurrencyUsed => $printerQuotaCurrencyUsed,
+					}
+				);
+				if ( $modify->code ) {
+					syslog('info', "$jobID;$ENV{PRINTER};$userName | -ERR Failed to subtract %s from localPrinterQuotaCurrencyRemaining and set to %s: %s", currency_format('usd', $cost/100, FMT_SYMBOL), currency_format('usd', $printerQuotaCurrencyRemaining/100, FMT_SYMBOL), $modify->error) if $syslog;
+					syslog('info', "$jobID;$ENV{PRINTER};$userName | -ERR Failed to add $pages pages to localPrinterQuotaPagesPrinted and set to $printerQuotaPagesPrinted: %s", currency_format('usd', $printerQuotaCurrencyRemaining/100, FMT_SYMBOL), $modify->error) if $syslog;
+					syslog('info', "$jobID;$ENV{PRINTER};$userName | -ERR Failed to add %s to localPrinterQuotaCurrencyUsed and set to %s: %s", currency_format('usd', $cost/100, FMT_SYMBOL), currency_format('usd', $printerQuotaCurrencyUsed/100, FMT_SYMBOL), $modify->error) if $syslog;
+					if ( $email ) {
+					}
+				} else {
+					syslog('info', "$jobID;$ENV{PRINTER};$userName | +OK Subtracted %s from localPrinterQuotaCurrencyRemaining and set to %s", currency_format('usd', $cost/100, FMT_SYMBOL), currency_format('usd', $printerQuotaCurrencyRemaining/100, FMT_SYMBOL)) if $syslog;
+					syslog('info', "$jobID;$ENV{PRINTER};$userName | +OK Added $pages pages to localPrinterQuotaPagesPrinted and set to $printerQuotaPagesPrinted", currency_format('usd', $printerQuotaCurrencyRemaining/100, FMT_SYMBOL)) if $syslog;
+					syslog('info', "$jobID;$ENV{PRINTER};$userName | +OK Added %s to localPrinterQuotaCurrencyUsed and set to %s", currency_format('usd', $cost/100, FMT_SYMBOL), currency_format('usd', $printerQuotaCurrencyUsed/100, FMT_SYMBOL)) if $syslog;
+				}
+			}
+			if ( $banner >= 2 ) {
+				@_ = ( currency_format('usd', $cost/100, FMT_SYMBOL), currency_format('usd', $printerQuotaCurrencyRemaining/100, FMT_SYMBOL), currency_format('usd', $printerQuotaCurrencyUsed/100, FMT_SYMBOL) );
+				printer($progpath, $backend, $uri, $jobID, $userName, 'BANNER: Successful', "Date: $date\r\nUsername: $userName\r\nJob Title: $jobTitle\r\nPages Printed: $pages\r\nCost of Job: $_[0]\r\nAccount Balance: $_[1]\r\nLife-time Pages Printed: $printerQuotaPagesPrinted\r\nLife-time Money Used: $_[2]\r\n", $printOptions);
+				$dd = 1;
+			}
+			if ( $email ) {
+			}
+		}
+	# Insufficient funds
+	} else {
+		syslog('info', "$jobID;$ENV{PRINTER};$userName | Insufficient Funds.  Cost: %s, Account balance: %s", currency_format('usd', $cost/100, FMT_SYMBOL), currency_format('usd', $printerQuotaCurrencyRemaining/100, FMT_SYMBOL)) if $syslog;
+		if ( $banner >= 1 ) {
+			@_ = ( currency_format('usd', $cost/100, FMT_SYMBOL), currency_format('usd', $printerQuotaCurrencyRemaining/100, FMT_SYMBOL), currency_format('usd', $printerQuotaCurrencyUsed/100, FMT_SYMBOL) );
+			printer($progpath, $backend, $uri, $jobID, $userName, 'BANNER: Insufficient Funds', "Date: $date\r\nUsername: $userName\r\nJob Title: $jobTitle\r\nPages Attempted: $pages\r\nCost of Job: $_[0]\r\nAccount Balance: $_[1]\r\nLife-time Pages Printed: $printerQuotaPagesPrinted\r\nLife-time Money Used: $_[2]\r\n", $printOptions);
+			$dd = 1;
+		}
+		if ( $email ) {
+		}
+	}
+# Not using LDAP
+} else {
+	syslog('info', "$jobID;$ENV{PRINTER};$userName | Quota support disabled and printing all $pages pages") if $syslog;
+	$exitvalue = printer($progpath, $backend, $uri, $jobID, $userName, $jobTitle, $copies, $printOptions, $printFile, $sizeof, $pages, $printerQuotaCurrencyRemaining);
+	if ( $banner >= 1 ) {
+		printer($progpath, $backend, $uri, $jobID, $userName, 'BANNER: No LDAP', "Date: $date\r\nUsername: $userName\r\nJob Title: $jobTitle\r\nPages Printed: $pages\r\n", $printOptions);
+		$dd = 1;
+	}
+	if ( $email ) {
+	}
+}
+
+syslog('info', "$jobID;$ENV{PRINTER};$userName | Exit value: $exitvalue") if $syslog && $debug >= 2;
+$exitvalue = 0 if $dd;
+closelog();
+exit $exitvalue;
+
+
+############   S U B s   #################
+
+
+sub printer {
+	my ($progpath, $backend, $uri, $jobID, $userName, $jobTitle, $copies, $printOptions, $printFile, $sizeof, $pages, $printerQuotaRemaining) = @_;
+	die "Usage: printer(progpath, backend, uri, jobID, userName, jobTitle, copies|banner, printOptions)\n" unless $progpath && $backend && $uri && $jobID && $userName && $jobTitle && $copies && $printOptions;
+	$copies = $jobTitle if $copies < 0;
+	unless ( $printFile ) {
+		$printFile = "$ENV{TMPDIR}/cups.quota.banner.$$";
+		$copies =~ s/\%jobTitle/$jobTitle/g;
+		open BANNER, ">$printFile";
+		print BANNER $copies;
+		close BANNER;
+		$copies = 1;
+	}
+	# Grab a copy of the print file
+	if ( $debug >= 5 ) {
+		my $md5 = md5_hex($jobTitle);
+		my $tmp = "$ENV{TMPDIR}/cups.quota.printfile.$$.$md5";
+		$_ = qx{/bin/cp $printFile $tmp};
+		if ( -e $tmp ) {
+			syslog('info', "$jobID;$ENV{PRINTER};$userName | -ERR '$jobTitle' NOT saved as $tmp: $_") if $syslog;
+		} else {
+			syslog('info', "$jobID;$ENV{PRINTER};$userName | +OK '$jobTitle' saved as $tmp") if $syslog;
+		}
+	}
+	my $exitvalue;
+	do {
+		syslog('info', "$jobID;$ENV{PRINTER};$userName | $backend,$uri,$jobID,$userName,$jobTitle,$copies,$printOptions,$printFile") if $syslog && $debug >= 2;
+		# insert a timeout/alarm
+		if ( $debug >= 3 && $printFile !~ /cups\.quota\.banner\.\$\$$/ ) {
+			syslog('info', "$jobID;$ENV{PRINTER};$userName | *** Simulated Print: $jobTitle ***") if $syslog;
+			$exitvalue = 0
+		} elsif ( $debug >= 4 ) {
+			syslog('info', "$jobID;$ENV{PRINTER};$userName | *** Simulated Print: $jobTitle ***") if $syslog;
+			$exitvalue = 0
+		} else {
+			$exitvalue = system {"$progpath/$backend"} ($uri, $jobID, $userName, $jobTitle, $copies, $printOptions, $printFile);
+			$exitvalue = $exitvalue >> 8;
+		}
+		sleep $delay if $delay > 0;
+	} until ( !$exitvalue || $attempts-- <= 0);
+	unlink $printFile if $delete;
+	if ( $exitvalue ) {
+		syslog('info', "$jobID;$ENV{PRINTER};$userName | -ERR Failed to print '$jobTitle': $exitvalue") if $syslog;
+	} else {
+		syslog('info', "$jobID;$ENV{PRINTER};$userName | +OK Printed '$jobTitle'") if $syslog;
+	}
+	return $exitvalue;
+}
+
+sub bindpw {
+	my ($passwordfile) = @_;
+	open P, $passwordfile or do { syslog('info', "$jobID;$ENV{PRINTER};$userName | Can't open passwordfile: $!") if $syslog; return undef; };
+	chomp(my $password = <P>);
+	close P;
+	return $password;
+}

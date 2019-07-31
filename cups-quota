@@ -1,0 +1,535 @@
+#!/usr/bin/perl
+
+# ToDo:
+# Something to eliminate duplicates, to ignore when a user presses print several times in a row.
+# How to handle when pkpgcounter fails?
+# Fix Debug levels
+# Fix hard-coded 5 for Low Balance
+
+use strict;
+use warnings;
+use Sys::Syslog;
+use Digest::MD5 qw{md5_hex};
+use Net::LDAP;
+use Net::LDAP::Entry;
+use Locale::Currency::Format;
+
+$0 =~ m!^(.*)/([^/]+)\s*$!;
+my $progname = ($2 || $0);
+my $progpath = ($1 || "/usr/lib/cups/backend");
+
+print STDERR "WARNING: Starting Quota Backend!\n";
+do { usage(); exit 0; } unless $ARGV[0];
+do { usage(); exit 1; } if scalar(@ARGV) < 5 || scalar(@ARGV) > 6;
+my ($jobID, $userName, $jobTitle, $copies, $printOptions, $printFile) = @ARGV;
+
+# Parse /etc/cups/printers.conf DeviceURI
+$_ = $ENV{DEVICE_URI};
+my ($defbalance, $allowguest, $ldaphost, $binddn, $passwordfile, $basedn, $defcost, $defallow, $defwatermark, $defbanner, $defemail, $dd, $attempts, $delay, $backup, $defsyslog, $defdebug, $defsimulate, $uri) = (1, 1, '', '', '', '', 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 2, '');
+# quota:/1;1/localhost;cn=Manager,o=IL;/etc/ldap.secret.cups;ou=People,o=IL/$2.50($0.05);1;0;0;0/1;3;5;0/1;2;0/socket://npi846b90.immanuel-washington.com
+if ( m!^$progname:/+([^;]+);(\d+)/+([^;]+);([^;]+);([^;]+);([^;]+)/+([^;]+);(\d+);(\d+);(\d+);(\d+)/+(\d+);(\d+);(\d+);(\d+)/+(\d+);(\d+);(\d+)/+(\S+)$! ) {
+	($defbalance, $allowguest, $ldaphost, $binddn, $passwordfile, $basedn, $defcost, $defallow, $defwatermark, $defbanner, $defemail, $dd, $attempts, $delay, $backup, $defsyslog, $defdebug, $defsimulate, $uri) = ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19);
+} else {
+	die "ERROR: Device URI does not match regex.\n";
+}
+$uri =~ m!^([^:\s]+):!;
+my $backend = $1;
+$ENV{DEVICE_URI} = $uri;
+# Quota support disabled
+if ( $defbalance =~ /^0$/ ) {
+	my $exitvalue = system {"$progpath/$backend"} ($uri, $jobID, $userName, $jobTitle, $copies, $printOptions, $printFile);
+	$exitvalue = $exitvalue >> 8;
+	return $exitvalue;
+}
+
+# Initialize variables
+my $printerQuotaRemaining = 0;
+my $printerQuotaUsed = 0;
+my $printerQuotaPagesPrinted = 0;
+my $printerQuotaPrinter = 0;
+my $pages = int(qx{/usr/bin/pkpgcounter $printFile});
+my $jobcost = 0;
+my $sizeof = -s $printFile;
+my $exitvalue = '';
+my ($method, $cost, $allow, $watermark, $banner, $email, $syslog, $debug, $simulate) = ('', $defcost, $defallow, $defwatermark, $defbanner, $defemail, $defsyslog, $defdebug, $defsimulate);
+my %printer = (
+	progpath => $progpath,
+	backend => $backend,
+	uri => $uri,
+	jobID => $jobID,
+	userName => $userName,
+	printOptions => $printOptions,
+);
+my %job = (
+	jobTitle => $jobTitle,
+	copies => $copies,
+	printFile => $printFile,
+);
+my %stats = (
+	total => \$printerQuotaPagesPrinted,
+	used => \$printerQuotaUsed,
+	balance => \$printerQuotaRemaining,
+	printer => \$printerQuotaPrinter,
+	jobcost => \$jobcost,
+	sizeof => \$sizeof,
+	pages => \$pages,
+);
+my %settings = (
+	method => \$method,  
+	cost => \$cost,
+	allow => \$allow,
+	watermark => \$watermark,
+	banner => \$banner,
+	email => \$email,
+	syslog => \$syslog,
+	debug => \$debug,
+	simulate => \$simulate,
+);
+
+# Logging
+openlog($progname, 'pid', 'syslog') if $syslog;
+quotalog(2, "ENV: $_");
+
+# Connect to LDAP
+my ($ldap, $bind, $useldap);
+if ( $ldap = Net::LDAP->new($ldaphost, version => 3, timeout => 3) ) {
+	$bind = $binddn && $passwordfile ? $ldap->bind($binddn, password=>bindpw($passwordfile)) : $ldap->bind();
+	undef $passwordfile;
+	if ( $bind->code ) {
+		quotalog(0, "Invalid DN and/or password: $binddn");
+		undef $ldap;
+		undef $bind;
+	}
+}
+if ( $ldap && $bind && $basedn ) {
+	$useldap = 1;
+	quotalog(1, "Using LDAP");
+} else {
+	$useldap = 0;
+	quotalog(0, "NOT using LDAP");
+}
+
+# Create in LDAP the necessary attributes with defaults
+my $entry;
+if ( $useldap ) {   
+	my $search = $ldap->search(base=>$basedn, filter=>"uid=$userName");
+	if ( $search->code ) {
+		$useldap = 0;
+		quotalog(0, "LDAP Error: %s", $search->error);
+	} elsif ( $search->count <= 0 ) {
+		$useldap = 0;
+		quotalog(0, "Username not found in LDAP");
+		quotalog(0, $allowguest ? "Allowing guest printing" : "Not allowing guest printing");
+		exit 0 unless $allowguest;
+	} else {
+		$entry = $search->entry(0);
+		my @oc = $entry->get_value('objectClass');
+		# objectClass: local
+		if ( grep { /^local$/i } @oc ) {
+			quotalog(1, "local objectClass already added");
+		} else {
+			my $modify = $ldap->modify($entry->dn, add => {objectClass => 'local'});
+			if ( $modify->code ) {
+				$useldap = 0;
+				quotalog(0, "-ERR Failed to add objectClass local: %s", $modify->error);
+			} else {
+				quotalog(1, "+OK Added objectClass local");
+			}
+		}
+		# localPrinterQuotaPrinter: $ENV{PRINTER} (HP3550)
+		if ( $entry->exists("localPrinterQuotaPrinter") ) {
+			my @printerQuotaPrinter = $entry->get_value("localPrinterQuotaPrinter");
+			@_ = grep { /^.?$ENV{PRINTER}/i && !/^.?Any/i } @printerQuotaPrinter;
+			unless ( $printerQuotaPrinter = $_[0] ) {
+				@_ = grep { /^.?Any/i } @printerQuotaPrinter;
+				$printerQuotaPrinter = $_[0];
+			}
+			unless ( $printerQuotaPrinter ) {
+				my $modify = $ldap->modify($entry->dn, add => {localPrinterQuotaPrinter => $ENV{PRINTER}});
+				if ( $modify->code ) {
+					$useldap = 0;
+					quotalog(0, "-ERR Failed to %s localPrinterQuotaPrinter: %s", ($defallow ? 'enable' : 'disable'), $modify->error);
+				} else {
+					$printerQuotaPrinter = $ENV{PRINTER};
+					quotalog(1, "+OK %s localPrinterQuotaPrinter", ($defallow ? 'Enabled' : 'Disabled'));
+				}
+			}
+		} else {
+			my $modify = $ldap->modify($entry->dn, add => {localPrinterQuotaPrinter => $ENV{PRINTER}});
+			if ( $modify->code ) {
+				$useldap = 0;
+				quotalog(0, "-ERR Failed to %s localPrinterQuotaPrinter: %s", ($defallow ? 'enable' : 'disable'), $modify->error);
+			} else {
+				$printerQuotaPrinter = $ENV{PRINTER};
+				quotalog(1, "+OK %s localPrinterQuotaPrinter", ($defallow ? 'Enabled' : 'Disabled'));
+			}
+		}
+		# localPrinterQuotaPagesPrinted: 0
+		if ( $entry->exists("localPrinterQuotaPagesPrinted") ) {
+			$printerQuotaPagesPrinted = $entry->get_value("localPrinterQuotaPagesPrinted");
+			unless ( $printerQuotaPagesPrinted =~ /^\d+$/ ) {
+				quotalog(0, "localPrinterQuotaPagesPrinted attr corrupt.  Attempting to fix...");
+				my $modify = $ldap->modify($entry->dn, replace => {localPrinterQuotaPagesPrinted => 0});
+				if ( $modify->code ) {
+					$useldap = 0;
+					quotalog(0, "-ERR Failed to reset localPrinterQuotaPagesPrinted: %s", $modify->error);
+				} else {
+					$printerQuotaPagesPrinted = 0;
+					quotalog(1, "+OK Reset localPrinterQuotaPagesPrinted");
+				}
+			}
+		} else {
+			my $modify = $ldap->modify($entry->dn, add => {localPrinterQuotaPagesPrinted => 0});
+			if ( $modify->code ) {
+				$useldap = 0;
+				quotalog(0, "-ERR Failed to initialize localPrinterQuotaPagesPrinted: %s", $modify->error);
+			} else {
+				$printerQuotaPagesPrinted = 0;
+				quotalog(1, "+OK Initialized localPrinterQuotaPagesPrinted");
+			}
+		}
+
+		foreach my $m ( 'Pages', 'Currency' ) {
+		# localPrinterQuota${m}Remaining: $defbalance (250)
+		if ( $entry->exists("localPrinterQuota${m}Remaining") ) {
+			unless ( $printerQuotaRemaining =~ /^\d+$/ ) {
+				quotalog(0, "localPrinterQuota${m}Remaining attr corrupt.  Attempting to fix...");
+				my $modify = $ldap->modify($entry->dn, replace => {"localPrinterQuota${m}Remaining" => $defbalance});
+				if ( $modify->code ) {
+					$useldap = 0;
+					quotalog(0, "-ERR Failed to reset default %s to localPrinterQuota${m}Remaining: %s", display($defbalance), $modify->error);
+				} else {
+					quotalog(1, "+OK Reset localPrinterQuota${m}Remaining to default %s", display($defbalance));
+				}
+			}
+		} else {
+			my $modify = $ldap->modify($entry->dn, add => {"localPrinterQuota${m}Remaining" => $defbalance});
+			if ( $modify->code ) {
+				$useldap = 0;
+				quotalog(0, "-ERR Failed to initialize default %s to localPrinterQuota${m}Remaining: %s", display($defbalance), $modify->error);
+			} else {
+				quotalog(1, "+OK Initialized localPrinterQuota${m}Remaining to default %s", display($defbalance));
+			}
+		}
+		# localPrinterQuota${m}Used: 0
+		if ( $entry->exists("localPrinterQuota${m}Used") ) {
+			unless ( $printerQuotaUsed =~ /^\d+$/ ) {
+				quotalog(0, "localPrinterQuota${m}Used attr corrupt.  Attempting to fix...");
+				my $modify = $ldap->modify($entry->dn, replace => {"localPrinterQuota${m}Used" => 0});
+				if ( $modify->code ) {
+					$useldap = 0;
+					quotalog(0, "-ERR Failed to reset localPrinterQuota${m}Used: %s", $modify->error);
+				} else {
+					quotalog(1, "+OK Reset localPrinterQuota${m}Used");
+				}
+			}
+		} else {
+			my $modify = $ldap->modify($entry->dn, add => {"localPrinterQuota${m}Used" => 0});
+			if ( $modify->code ) {
+				$useldap = 0;
+				quotalog(0, "-ERR Failed to initialize localPrinterQuota${m}Used: %s", $modify->error);
+			} else {
+				quotalog(1, "+OK Initialized localPrinterQuota${m}Used");
+			}
+		}
+		}
+	}
+} else {
+	$useldap = 0;
+	quotalog(0, "Cannot connect to LDAP as requested.");
+}
+
+# Do the math
+if ( $useldap ) {
+	# Per-user, per-printer settings
+	if ( $printerQuotaPrinter =~ m!^(.?)($ENV{PRINTER}|Any)$!i ) {
+		$allow = 0 if $1 eq '!';
+		$allow = -1 if $1 eq '*';
+		quotalog(1, "Minimal user-defined printer settings");
+	} elsif ( $printerQuotaPrinter =~ m!:/(\$\d*\.\d{2}|\d+|-);(-?\d+|-);(\d+|-);(\d+|-);(\d+|-)/$!i ) {
+		($cost, $allow, $watermark, $banner, $email) = ($1, $2, $3, $4, $5);
+		$cost = $defcost if $cost eq '-';
+		$allow = $defallow if $allow eq '-';
+		$watermark = $defwatermark if $watermark eq '-';
+		$banner = $defbanner if $banner eq '-';
+		$email = $defemail if $email eq '-';
+		quotalog(1, "User-defined printer settings");
+	} elsif ( $printerQuotaPrinter =~ m!:/+(\$\d*\.\d{2}|\d+|-);(-?\d+|-);(\d+|-);(\d+|-);(\d+|-)/+(\d+|-);(\d+|-);(\d+|-)/+$!i ) {
+		($cost, $allow, $watermark, $banner, $email, $syslog, $debug, $simulate) = ($1, $2, $3, $4, $5, $6, $7, $8);
+		$cost = $defcost if $cost eq '-';
+		$allow = $defallow if $allow eq '-';
+		$watermark = $defwatermark if $watermark eq '-';
+		$banner = $defbanner if $banner eq '-';
+		$email = $defemail if $email eq '-';
+		$syslog = $defsyslog if $syslog eq '-';
+		$debug = $defdebug if $debug eq '-';
+		$simulate = $defsimulate if $simulate eq '-';
+		quotalog(1, "Extended user-defined printer settings");
+	}
+	quotalog(1, "Printer settings: C:$cost, A:$allow, W:$watermark, B:$banner, E:$email, S:$syslog, D:$debug, M:$simulate");
+
+	# Calculate Job Cost
+	($cost, $method) = parseCost($cost);
+	$jobcost = $pages * ${$settings{cost}};
+	quotalog(1, "Job Cost: %s", display($jobcost));
+
+	# Get Used/Remaining
+	$printerQuotaUsed = $entry->get_value("localPrinterQuota${$settings{method}}Used"); $printerQuotaUsed =~ s/\D//g;
+	$printerQuotaRemaining = $entry->get_value("localPrinterQuota${$settings{method}}Remaining"); $printerQuotaRemaining =~ s/\D//g;
+
+	quotalog(2, "localprinterQuotaRemaining = ".display($printerQuotaRemaining));
+	quotalog(2, "localprinterQuotaUsed = ".display($printerQuotaUsed));
+	quotalog(2, "localprinterQuotaPrinter = ".display($printerQuotaPrinter));
+	# Printing disabled on this printer for this user
+	if ( $allow == 0 ) {
+		quotalog(0, "Printer disabled for user");
+		if ( $banner >= 1 ) {
+			my $bannerTitle = 'BANNER: Printer disabled for user';
+			my $bannerMessage = "Printing to $ENV{PRINTER} for $userName not allowed.";
+			$dd = banner(1, $bannerTitle, $bannerMessage);
+		}
+		if ( $email >= 1 ) {
+			email('Printer disable', display($printerQuotaRemaining).' Remaining');
+		}
+	# Go ahead with printing
+	} elsif ( $allow == -1 || $printerQuotaRemaining - $jobcost >= 0 ) {
+		$exitvalue = printer($jobTitle, $copies, $printFile);
+		# Error printing
+		if ( $exitvalue ) {
+			quotalog(0, "-ERR Failed to print $pages pages of '$jobTitle': $exitvalue");
+		# Successful printing
+		} else {
+			$printerQuotaUsed += $jobcost;
+			$printerQuotaPagesPrinted += $pages;
+			# Unlimited printing
+			if ( $allow == -1 ) {
+				quotalog(0, "Infinite account balance for $printer{userName} on $ENV{PRINTER}");
+				my $modify = $ldap->modify($entry->dn,
+					replace => {
+						localPrinterQuotaPagesPrinted => $printerQuotaPagesPrinted,
+						"localPrinterQuota${$settings{method}}Used" => $printerQuotaUsed,
+					}
+				);
+				if ( $modify->code ) {
+					quotalog(0, "-ERR Failed to add $pages pages to localPrinterQuotaPagesPrinted and set to $printerQuotaPagesPrinted pages: %s", $modify->error);
+					quotalog(0, "-ERR Failed to add %s to localPrinterQuota${$settings{method}}Used and set to %s: %s", display($jobcost, $printerQuotaUsed), $modify->error);
+					if ( $email ) {
+						email('Error: 1');
+					}
+				} else {
+					quotalog(1, "+OK Added $pages pages to localPrinterQuotaPagesPrinted and set to $printerQuotaPagesPrinted pages");
+					quotalog(1, "+OK Added %s to localPrinterQuota${$settings{method}}Used and set to %s", display($jobcost, $printerQuotaUsed));
+				}
+			# Subtract the jobcost from the account balance
+			} else {
+				$printerQuotaRemaining -= $jobcost;
+				if ( $printerQuotaRemaining <= ${$settings{cost}} * 5 ) {
+					quotalog(0, "Low Balance for $printer{userName}");
+					email('Low Balance', display($printerQuotaRemaining).' Remaining');
+				}
+				my $modify = $ldap->modify($entry->dn,
+					replace => {
+						localPrinterQuotaPagesPrinted => $printerQuotaPagesPrinted,
+						"localPrinterQuota${$settings{method}}Used" => $printerQuotaUsed,
+						"localPrinterQuota${$settings{method}}Remaining" => $printerQuotaRemaining,
+					}
+				);
+				if ( $modify->code ) {
+					quotalog(0, "-ERR Failed to add $pages pages to localPrinterQuotaPagesPrinted and set to $printerQuotaPagesPrinted: %s", display($printerQuotaRemaining), $modify->error);
+					quotalog(0, "-ERR Failed to add %s to localPrinterQuota${$settings{method}}Used and set to %s: %s", display($jobcost, $printerQuotaUsed), $modify->error);
+					quotalog(0, "-ERR Failed to subtract %s from localPrinterQuota${$settings{method}}Remaining and set to %s: %s", display($jobcost, $printerQuotaRemaining), $modify->error);
+					if ( $email ) {
+						email('Error: 2');
+					}
+				} else {
+					quotalog(1, "+OK Added $pages pages to localPrinterQuotaPagesPrinted and set to $printerQuotaPagesPrinted pages", display($printerQuotaRemaining));
+					quotalog(1, "+OK Added %s to localPrinterQuota${$settings{method}}Used and set to %s", display($jobcost, $printerQuotaUsed));
+					quotalog(1, "+OK Subtracted %s from localPrinterQuota${$settings{method}}Remaining and set to %s", display($jobcost, $printerQuotaRemaining));
+				}
+			}
+			if ( $banner >= 2 ) {
+				my $bannerTitle = 'BANNER: Successful';
+				my $bannerMessage = "Successfully printed.";
+				$dd = banner(0, $bannerTitle, $bannerMessage);
+			}
+			if ( $email >= 2 ) {
+				email('Successful', display($printerQuotaRemaining).' Remaining');
+			}
+			quotalog(0, "Successfully printed $pages pages of '$jobTitle' at a jobcost of %s and set balance to %s", display($jobcost), display($printerQuotaRemaining));
+		}
+	# Insufficient funds
+	} else {
+		quotalog(0, "Insufficient Funds.  Cost: %s, Account balance: %s", display($jobcost, $printerQuotaRemaining));
+		if ( $banner >= 1 ) {
+			my $bannerTitle = 'BANNER: Insufficient Funds';
+			my $bannerMessage = "Insufficient funds to print.";
+			$dd = banner(1, $bannerTitle, $bannerMessage);
+		}
+		if ( $email >= 1 ) {
+			email('Insufficient Funds', display($printerQuotaRemaining).' Remaining');
+		}
+	}
+# Not using LDAP
+} else {
+	quotalog(0, "Quota support disabled and printing all $pages pages");
+	$exitvalue = printer($jobTitle, $copies, $printFile);
+	if ( $banner >= 1 ) {
+		my $bannerTitle = 'BANNER: No LDAP';
+		my $bannerMessage = "Quota support disabled.";
+		$dd = banner($exitvalue, $bannerTitle, $bannerMessage);
+	}
+	if ( $email >= 1 ) {
+	}
+}
+
+quotalog(1, "Exit value: $exitvalue");
+$exitvalue = 0 if $dd;
+closelog();
+exit $exitvalue;
+
+
+############   S U B s   #################
+
+
+sub printer {
+	my ($jobTitle, $copies, $printFile) = @_;
+	quotalog(2, "Attempting to print $pages pages of '$jobTitle'");
+
+	$printFile = watermark($printFile) if $watermark;
+
+	# Grab a copy of the print file
+	# FIX: ERRing when shouldn't
+	if ( $backup ) {
+		my $md5 = md5_hex($jobTitle);
+		my $tmp = "$ENV{TMPDIR}/cups.quota.printfile.$$.$md5";
+		$_ = qx{/bin/cp $printFile $tmp; echo \$?};
+		if ( -e $tmp ) {
+			quotalog(0, "-ERR '$jobTitle' ($printFile) NOT saved as $tmp: $_");
+		} else {
+			quotalog(1, "+OK '$jobTitle' ($printFile) saved as $tmp");
+		}
+	}
+	my $exitvalue;
+	do {
+		quotalog(2, "$printer{backend},$printer{uri},$printer{jobID},$printer{userName},$jobTitle,$copies,$printer{printOptions},$printFile");
+		# insert a timeout/alarm
+		if ( ${$settings{simulate}} >= 1 && $printFile !~ /cups\.quota\.banner\.\$\$$/ ) {
+			quotalog(0, "*** Simulated Print: $jobTitle ***");
+			$exitvalue = 0
+		} elsif ( ${$settings{simulate}} >= 2 ) {
+			quotalog(0, "*** Simulated Print: $jobTitle ***");
+			$exitvalue = 0
+		} else {
+			$exitvalue = system {"$printer{progpath}/$printer{backend}"} ($printer{uri},$printer{jobID},$printer{userName},$jobTitle,$copies,$printer{printOptions},$printFile);
+			$exitvalue = $exitvalue >> 8;
+		}
+		sleep $delay if $exitvalue && $delay > 0;
+	} until ( !$exitvalue || $attempts-- <= 0);
+	if ( $exitvalue ) {
+		quotalog(0, "-ERR Failed to print '$jobTitle': $exitvalue");
+	} else {
+		quotalog(1, "+OK Printed '$jobTitle' to $ENV{PRINTER}");
+	}
+	return $exitvalue;
+}
+
+sub watermark {
+	return $_[0] if $_[0] =~ /cups\.quota\.banner\.\d+$/;
+	quotalog(2, "Attempting to watermark document...");
+	my $flag = 0;
+	my $md5 = md5_hex($job{jobTitle});
+	my $tmp = "$ENV{TMPDIR}/cups.quota.watermark.$$.$md5";
+	my ($pages, $total, $jobcost, $balance) = (${$stats{pages}}, ${$stats{total}}, ${$stats{jobcost}}, ${$stats{balance}});
+	$total += $pages unless ${$settings{allow}} == -1; 
+	$balance -= $jobcost unless ${$settings{allow}} == -1; 
+	$_[1] ||= "$job{jobTitle} ($pages/$total pages) printed for $printer{userName} (".display($jobcost).'/'.display($balance).')';
+	open PS, $_[0] or return undef;
+	my @ps = <PS>;
+	close PS;
+	open PS, ">$tmp";
+	foreach ( @ps ) {
+		if (/^\(?%%\[?Page:/) {
+			print PS "grestore\n" if $flag;
+			$flag = 1;
+			print PS $_."gsave\n.5 setgray 306 12 moveto\n/Helvetica-Bold findfont 7 scalefont setfont\n($_[1]) dup\nstringwidth pop 2 div neg 0 rmoveto\nshow\ngrestore\n";
+			quotalog(1, "+OK Watermarked '$job{jobTitle}' to $tmp");
+		} else {
+			print PS $_;
+		}
+	}
+	close PS;
+	return $flag ? $tmp : $_[0];
+}
+
+sub banner {
+	quotalog(2, "Attempting to print banner...");
+	my ($ev, $title, $msg) = @_;
+
+	my $date = scalar localtime();
+	my @return = ();
+	push @return, "Date: $date";
+	push @return, "Username: $printer{userName}";
+	push @return, "Job Title: $job{jobTitle}";
+	push @return, "Pages ".($ev?"Attempted":"Printed").": ${$stats{pages}}" if defined ${$stats{pages}};
+	push @return, "Size of Job: ${$stats{sizeof}} bytes" if defined ${$stats{sizeof}};
+	push @return, "Cost of Job: ".display(${$stats{jobcost}}) if defined ${$stats{jobcost}};
+	push @return, "Account Balance: ".display(${$stats{balance}}) if defined ${$stats{balance}};
+	push @return, "Life-time Pages Printed: ${$stats{total}}" if defined ${$stats{total}};
+	push @return, "";
+	push @return, $msg if $msg;
+
+	$printFile = "$ENV{TMPDIR}/cups.quota.banner.$$";
+	open BANNER, ">$printFile";
+	print BANNER join "\r\n", @return;
+	close BANNER;
+
+	printer($title, 1, $printFile);
+	return 1;
+}
+
+sub email {
+	quotalog(2, "Attempting to email information: $_[0] / $_[1]");
+	qx{echo '$_[1]' | env MAILRC=/dev/null from=cups-quota smtp=smtp /usr/bin/nail -n -s 'CUPS-Quota: $_[0]' $printer{userName}};
+}
+
+sub parseCost {
+	if ( $_[0] =~ /\$/ ) {
+		$_[0] =~ s/\D//g;
+		quotalog(2, "Method: Currency");
+		return $_[0], 'Currency';
+	} else {
+		$_[0] =~ s/\D//g;
+		quotalog(2, "Method: Pages");
+		return $_[0], 'Pages';
+	}
+}
+
+sub quotalog {
+	my $d = shift @_;
+	syslog('info', "$printer{userName};$ENV{PRINTER}: $d: $_[0]", @_[1..$#_]) if ${$settings{syslog}} && ${$settings{debug}} >= $d;
+}
+
+sub display {
+	my @return = map { ${$settings{method}} eq 'Pages' ? "$_ pages" : currency_format('usd', $_/100, FMT_SYMBOL) } @_;
+	return wantarray ? @return : $return[0];
+}
+
+sub usage {
+	print STDERR "ERROR: Usage: $progname job-id user title copies options [file]\n";
+	print STDERR "ERROR: export DEVICE_URI=\n";
+	print STDERR "ERROR: \t$progname:/\n";
+	print STDERR "ERROR: \t/defbalance;allowguest/\n";
+	print STDERR "ERROR: \t/ldaphost;binddn;passfile;basedn/\n";
+	print STDERR "ERROR: \t/defcost;defallow;defwatermark;defbanner;defemail/\n";
+	print STDERR "ERROR: \t/dd;att;delay;backup/\n";
+	print STDERR "ERROR: \t/log;debug;simulate/\n";
+	print STDERR "ERROR: \t/<original uri>\n";
+}
+
+sub bindpw {
+	my ($passwordfile) = @_;
+	open P, $passwordfile or do { quotalog(0, "Can't open passwordfile: $!"); return undef; };
+	chomp(my $password = <P>);
+	close P;
+	return $password;
+}

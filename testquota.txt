@@ -1,0 +1,5 @@
+export PRINTER="HP3550"
+export TMPDIR=/var/spool/cups/tmp
+export DEVICE_URI='quota://250;0/localhost;cn=Manager,o=M200;/etc/ldap.secret.cups;ou=People,o=M200/$0.05;1;1;2;0/1;3;5;0/1;2;2/socket://192.168.0.148'
+ldap_setattr -r uid=Cogent,ou=People,o=m200 localPrinterQuotaPrinter 'HP3550:/$0.01;-;1;1;-/-;2;-/'
+/usr/lib/cups/backend/quota 1 cogent test 1 "" /etc/hosts
